@@ -1,0 +1,1632 @@
+#!/usr/bin/ucode
+// autoaddd: watches failed and stalled connections of selected LAN hosts and routes
+// only the blocked destinations (by domain when the name is known, else by address) through podkop.
+'use strict';
+
+let fs = require("fs");
+let uloop = require("uloop");
+let ubus = require("ubus");
+let uci = require("uci");
+// optional: without it site names come from dnsmasq alone
+let socket = null;
+try { socket = require("socket"); } catch (e) {}
+
+const VERSION = "3.0.7";
+// the daemon takes no arguments. A copy started by hand next to the service flushes the same
+// nft sets and wipes its probe directory, so anything like "autoaddd -v" only prints the version
+if (length(ARGV)) {
+	print(VERSION + "\n");
+	exit(0);
+}
+const DB = "/etc/autoadd/db.json";
+const LIST = "/etc/lists/autoadd_ips.lst";
+const DLIST = "/etc/lists/autoadd_domains.lst";
+const RULESET_DIR = "/tmp/sing-box/rulesets";
+const RUN = "/tmp/autoadd";
+const PROBE = "/usr/libexec/autoadd-probe";
+const UPDATER = "/usr/libexec/autoadd-update";
+
+const TICK_MS = 10000;
+const MAX_LOG = 200;
+const MAX_CANDS = 600;
+const MAX_ADDED = 1000;
+const MAX_AUTO_PER_HOUR = 40;
+const MAX_NAMES = 2000;
+const BATCH = 8;
+const RECHECK_SEC = 6 * 3600;
+const UPDATE_CHECK_SEC = 24 * 3600;
+const UPDATE_FIRST_SEC = 120;
+const RECHECK_CONFIRM_SEC = 1800;
+const TIP_SEC = 3600;
+const DOMAIN_GRACE_SEC = 1800;
+const SHOW_ROWS = 30;
+const CUT_MIN = 12000;
+const CUT_MAX = 48000;
+const CONNTRACK = "/proc/net/nf_conntrack";
+// UDP: polls and seconds a candidate must stay unanswered before it is sent through podkop on trial
+const UDP_HITS = 2;
+const UDP_MIN_SEC = 8;
+// a device whose UDP destinations lie in more networks (/16) than this at once is exchanging
+// with peers (torrent client, TorrServer), its candidates are not added. The relays of a game
+// sit in a few networks of its operator, however many addresses they have
+const UDP_PEERS = 30;
+// an exchange that had answers and lost them: packets sent since the last answer and seconds without one
+const UDP_STALL_PKTS = 10;
+const UDP_STALL_SEC = 20;
+// an unconfirmed trial is not repeated earlier than this
+const UDP_RETRY_SEC = 3600;
+const UDP_TRIALS = 16;
+// a trial is judged after UDP_GRACE_SEC, when the flow that was opened directly has expired
+const UDP_GRACE_SEC = 90;
+const UDP_MUTE_TICKS = 6;
+const UDP_WAIT_SEC = 180;
+const UDP_BAD_SEC = 24 * 3600;
+const UDP_IDLE_SEC = 7 * 24 * 3600;
+const MAX_PCS = 32;
+const LEASES = "/tmp/dhcp.leases";
+// addresses on trial, kept off the flash; read at start to take them back from podkop
+const TRIALS = RUN + "/trials.json";
+
+let cfg = { pcs: [], auto: true, autoupdate: false, proxy: "socks5://127.0.0.1:4534", section: "main" };
+// added: by address; domains: by name; tips: addresses routed for TIP_SEC after a domain
+// is added, until DNS caches forget the real address
+let db = { added: {}, domains: {}, tips: {}, ignore: {} };
+let log_day = localtime().yday;
+let cands = {};
+let logbuf = [];
+let auto_times = [];
+let probing = false;
+let started = time();
+let last_table_check = 0;
+let names = {};
+let flows = {};
+let ct_missing = false;
+// udp_bad: addresses that stayed silent through the proxy too; udp_mute: ticks a trial got no answer
+let udp_bad = {};
+let udp_mute = {};
+// udp_base: answers every flow of an address had when its trial began
+let udp_base = {};
+// udp_wait: addresses whose trial ended unconfirmed, and when they may be tried again
+let udp_wait = {};
+// uflows: answered UDP flows of the watched devices as of the previous tick
+let uflows = {};
+// conntrack table as read in the current tick
+let ct_text = null;
+let ct_read_done = false;
+let dns_sub = null;
+let dns_ok = false;
+// sniff: raw socket that hears the DNS answers podkop gives dnsmasq
+let sniff = null;
+let sniff_handle = null;
+let sniff_next = 0;
+let sniff_said = false;
+let conn = null;
+let upd = { latest: null, checked: 0, state: "idle", error: null, next: started + UPDATE_FIRST_SEC };
+
+function log(msg) {
+	push(logbuf, { t: time(), m: msg });
+	while (length(logbuf) > MAX_LOG)
+		shift(logbuf);
+}
+
+function parse_ip(ip) {
+	if (type(ip) != "string")
+		return null;
+	let m = match(ip, /^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/);
+	if (!m)
+		return null;
+	let o = [ +m[1], +m[2], +m[3], +m[4] ];
+	for (let x in o)
+		if (x > 255)
+			return null;
+	return o;
+}
+
+function is_public(ip) {
+	let o = parse_ip(ip);
+	if (!o)
+		return false;
+	if (o[0] == 0 || o[0] == 10 || o[0] == 127 || o[0] >= 224)
+		return false;
+	if (o[0] == 100 && o[1] >= 64 && o[1] <= 127)
+		return false;
+	if (o[0] == 169 && o[1] == 254)
+		return false;
+	if (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
+		return false;
+	if (o[0] == 192 && o[1] == 168)
+		return false;
+	if (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+		return false;
+	return true;
+}
+
+function name_of(ip, ptr) {
+	let n = names[ip];
+	if (n) {
+		n.t = time();
+		return n.n;
+	}
+	return ptr ? "ptr:" + ptr : null;
+}
+
+function clean_domain(n) {
+	if (type(n) != "string" || length(n) > 253)
+		return null;
+	n = lc(rtrim(trim(n), "."));
+	return match(n, /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,23}$/) ? n : null;
+}
+
+function dom_of(ip) {
+	return clean_domain(names[ip]?.n);
+}
+
+function total_added() {
+	return length(db.added) + length(db.domains);
+}
+
+function kb(n) {
+	return sprintf("%.1f КБ", n / 1024.0);
+}
+
+function show_name(n) {
+	if (!n)
+		return "";
+	return " [" + (index(n, "ptr:") == 0 ? substr(n, 4) + " (PTR)" : n) + "]";
+}
+
+// ip is validated by the caller; blocks for at most ~2 s
+function ptr_lookup(ip) {
+	let p = fs.popen(`nslookup -timeout=2 -retry=1 ${ip} 127.0.0.1 2>/dev/null`, "r");
+	if (!p)
+		return null;
+	let out = p.read("all");
+	p.close();
+	let m = match(out ?? "", /name = ([0-9A-Za-z._-]{1,100})/);
+	return m ? rtrim(m[1], ".") : null;
+}
+
+function prune_names() {
+	let ks = keys(names);
+	if (length(ks) <= MAX_NAMES)
+		return;
+	ks = sort(ks, (a, b) => names[a].t - names[b].t);
+	for (let i = 0; i < length(ks) - MAX_NAMES + 500; i++)
+		delete names[ks[i]];
+}
+
+function load_cfg() {
+	let c = uci.cursor();
+	let pcs = c.get("autoadd", "main", "pc");
+	if (type(pcs) == "string")
+		pcs = [ pcs ];
+	cfg.pcs = filter(pcs ?? [], (ip) => parse_ip(ip) != null);
+	cfg.auto = c.get("autoadd", "main", "auto") != "0";
+	cfg.autoupdate = c.get("autoadd", "main", "autoupdate") == "1";
+	let proxy = c.get("autoadd", "main", "proxy");
+	if (type(proxy) == "string" && match(proxy, /^socks5h?:\/\/[0-9a-zA-Z.:]+$/))
+		cfg.proxy = proxy;
+	let section = c.get("autoadd", "main", "section");
+	if (type(section) == "string" && match(section, /^[0-9a-zA-Z_]+$/))
+		cfg.section = section;
+}
+
+function ruleset_path(kind) {
+	return `${RULESET_DIR}/${cfg.section}-local-${kind}-ruleset.json`;
+}
+
+function load_db() {
+	let s = fs.readfile(DB);
+	if (!s)
+		return;
+	try {
+		let j = json(s);
+		if (type(j?.added) == "object")
+			db.added = j.added;
+		if (type(j?.domains) == "object")
+			db.domains = j.domains;
+		if (type(j?.tips) == "object")
+			db.tips = j.tips;
+		if (type(j?.ignore) == "object")
+			db.ignore = j.ignore;
+		if (type(j?.last) == "object")
+			db.last = j.last;
+	}
+	catch (e) {
+		log("db.json повреждён, начинаю с пустого");
+	}
+}
+
+function write_atomic(path, data) {
+	// the flash is not written when nothing changed
+	if (fs.readfile(path) == data)
+		return true;
+	if (fs.writefile(path + ".new", data) == null)
+		return false;
+	return fs.rename(path + ".new", path) == true;
+}
+
+// an address on trial stays in memory until it is confirmed: most trials end in removal
+function save_db() {
+	fs.mkdir("/etc/autoadd");
+	let kept = {}, trials = [];
+	for (let ip, e in db.added) {
+		if (e.trial)
+			push(trials, ip);
+		else
+			kept[ip] = e;
+	}
+	write_atomic(DB, sprintf("%.1J\n", { ...db, added: kept }));
+	write_atomic(TRIALS, sprintf("%J\n", trials));
+}
+
+function save_list(dom) {
+	let l = sort(dom ? keys(db.domains) : filter(keys(db.added), (ip) => !db.added[ip].trial));
+	write_atomic(dom ? DLIST : LIST, length(l) ? join("\n", l) + "\n" : "");
+}
+
+function nft_setup() {
+	let pcs = length(cfg.pcs) ? `elements = { ${join(", ", cfg.pcs)} }` : "";
+	let rules = `table inet autoadd
+delete table inet autoadd
+table inet autoadd {
+	set pcs {
+		type ipv4_addr
+		${pcs}
+	}
+	set skip {
+		type ipv4_addr
+		flags interval
+		elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16,
+			     172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 }
+	}
+	set syn1 {
+		type ipv4_addr . inet_service . ipv4_addr . inet_service
+		flags dynamic,timeout
+		timeout 20s
+		size 4096
+	}
+	set cand_tcp {
+		type ipv4_addr . inet_service
+		flags dynamic,timeout
+		timeout 2m
+		size 512
+	}
+	set cand_stall {
+		type ipv4_addr . inet_service
+		flags dynamic,timeout
+		timeout 2m
+		size 512
+	}
+	set cand_cut {
+		type ipv4_addr . inet_service
+		flags dynamic,timeout
+		timeout 2m
+		size 512
+	}
+	set cand_udp {
+		type ipv4_addr . inet_service
+		flags dynamic,timeout
+		timeout 2m
+		size 256
+	}
+	chain gf_forward {
+		type filter hook forward priority filter - 10; policy accept;
+		ip saddr != @pcs return
+		ip daddr @skip return
+		tcp dport { 6881-6889, 6969, 7680 } return
+		udp dport { 6881-6889, 6969 } return
+		tcp flags & (syn | ack | rst | fin) == syn jump gf_syn
+		tcp flags & (fin | rst) != 0 ct original packets >= 4 jump gf_stall
+		meta l4proto udp udp dport != 443 ct reply packets == 0 ct original packets >= 4 update @cand_udp { ip daddr . udp dport }
+	}
+	chain gf_stall {
+		ct reply packets <= 2 update @cand_stall { ip daddr . tcp dport } return
+		# throttling freezes a connection after 16-25 KB of the answer
+		ct reply bytes 12000-48000 update @cand_cut { ip daddr . tcp dport }
+	}
+	chain gf_syn {
+		ip saddr . tcp sport . ip daddr . tcp dport @syn1 update @cand_tcp { ip daddr . tcp dport } return
+		update @syn1 { ip saddr . tcp sport . ip daddr . tcp dport }
+	}
+	chain gf_output {
+		type route hook output priority mangle - 1; policy accept;
+		tcp sport 61000-61063 meta mark set 0x00200000
+	}
+}
+`;
+	fs.mkdir(RUN);
+	fs.writefile(RUN + "/autoadd.nft", rules);
+	if (system([ "nft", "-f", RUN + "/autoadd.nft" ]) != 0)
+		log("не удалось загрузить таблицу nft autoadd");
+}
+
+// kind: "subnets" (field ip_cidr) or "domains" (field domain_suffix)
+// alt: another spelling of the same entry (podkop writes a host address without /32)
+function ruleset_patch(kind, field, val, add, alt) {
+	let path = ruleset_path(kind);
+	let s = fs.readfile(path);
+	if (!s)
+		return false;
+	let j;
+	try { j = json(s); } catch (e) { return false; }
+	if (type(j?.rules) != "array")
+		return false;
+	let rule = null;
+	for (let r in j.rules)
+		if (type(r?.[field]) == "array") {
+			rule = r;
+			break;
+		}
+	if (add) {
+		if (!rule) {
+			rule = {};
+			rule[field] = [];
+			push(j.rules, rule);
+		}
+		if (index(rule[field], val) >= 0 || (alt && index(rule[field], alt) >= 0))
+			return true;
+		push(rule[field], val);
+	}
+	else {
+		if (!rule || (index(rule[field], val) < 0 && (!alt || index(rule[field], alt) < 0)))
+			return true;
+		rule[field] = filter(rule[field], (c) => c != val && c != alt);
+	}
+	return write_atomic(path, sprintf("%.1J\n", j));
+}
+
+// quiet: at startup podkop may still be rebuilding the ruleset from the list file
+function apply_live(ip, add, quiet) {
+	system([ "nft", add ? "add" : "delete", "element", "inet", "PodkopTable", "podkop_subnets", `{ ${ip} }` ]);
+	// a flow opened before the switch keeps its NAT binding, so the answers that come the
+	// new way do not match it: a game that keeps sending from one socket never gets them.
+	// OpenWrt drops the conntrack entries of an address written to this file
+	if (!quiet)
+		fs.writefile(CONNTRACK, ip);
+	if (!ruleset_patch("subnets", "ip_cidr", ip + "/32", add, ip) && !quiet)
+		log(`${ip}: не удалось обновить ruleset sing-box, применится после перезапуска podkop`);
+}
+
+function apply_domain(d, add) {
+	if (!ruleset_patch("domains", "domain_suffix", d, add))
+		log(`${d}: не удалось обновить ruleset sing-box, применится после перезапуска podkop`);
+}
+
+function drop_cands(ip) {
+	for (let k in keys(cands))
+		if (cands[k].ip == ip)
+			delete cands[k];
+}
+
+function add_ip(ip, meta) {
+	db.added[ip] = meta;
+	if (!meta.trial)
+		db.last = { id: ip, ip, port: meta.port, name: meta.name, how: meta.how, ts: meta.ts };
+	delete db.tips[ip];
+	save_db();
+	save_list(false);
+	apply_live(ip, true);
+	drop_cands(ip);
+	log(`+ ${ip}${meta.port ? ":" + meta.port : ""}${show_name(meta.name)} (${meta.how == "auto" ? "авто" : "вручную"}): ${meta.why}`);
+	system([ "logger", "-t", "autoadd", `added ${ip} (${meta.how})` ]);
+}
+
+function del_ip(ip, why) {
+	let nm = show_name(db.added[ip]?.name);
+	delete db.added[ip];
+	save_db();
+	save_list(false);
+	apply_live(ip, false);
+	log(`- ${ip}${nm}: ${why}`);
+	system([ "logger", "-t", "autoadd", `removed ${ip}` ]);
+}
+
+function add_domain(d, meta) {
+	db.domains[d] = meta;
+	db.last = { id: d, ip: meta.ip, port: meta.port, name: d, how: meta.how, ts: meta.ts };
+	if (!meta.ip) {
+		let p = fs.popen(`nslookup ${d} 127.0.0.1 2>/dev/null`, "r");
+		if (p) {
+			let out = p.read("all") ?? "";
+			p.close();
+			for (let line in split(out, "\n")) {
+				let lm = match(line, /Address(?: [0-9]+)?: +([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
+				if (lm && parse_ip(lm[1]) && is_public(lm[1])) {
+					meta.ip = lm[1];
+					break;
+				}
+			}
+		}
+	}
+	let tip = meta.ip && !db.added[meta.ip];
+	if (tip)
+		db.tips[meta.ip] = meta.ts + TIP_SEC;
+	save_db();
+	save_list(true);
+	apply_domain(d, true);
+	if (tip)
+		apply_live(meta.ip, true);
+	if (meta.ip)
+		drop_cands(meta.ip);
+	log(`+ ${d}${meta.ip ? ` [${meta.ip}${meta.port ? ":" + meta.port : ""}]` : ""} (${meta.how == "auto" ? "авто" : "вручную"}): ${meta.why}`);
+	system([ "logger", "-t", "autoadd", `added ${d} (${meta.how})` ]);
+}
+
+function del_domain(d, why) {
+	let ip = db.domains[d]?.ip;
+	delete db.domains[d];
+	let tip = ip && db.tips[ip];
+	if (tip)
+		delete db.tips[ip];
+	save_db();
+	save_list(true);
+	apply_domain(d, false);
+	if (tip && !db.added[ip])
+		apply_live(ip, false);
+	log(`- ${d}: ${why}`);
+	system([ "logger", "-t", "autoadd", `removed ${d}` ]);
+}
+
+function expire_tips() {
+	let now = time(), changed = false;
+	for (let ip in keys(db.tips)) {
+		if (db.tips[ip] > now)
+			continue;
+		delete db.tips[ip];
+		changed = true;
+		if (!db.added[ip])
+			apply_live(ip, false);
+	}
+	if (changed)
+		save_db();
+}
+
+function sync_all() {
+	for (let ip in keys(db.added))
+		apply_live(ip, true, true);
+	for (let ip in keys(db.tips))
+		if (!db.added[ip])
+			apply_live(ip, true, true);
+	if (!length(db.domains))
+		return;
+	if (!fs.stat(ruleset_path("domains"))) {
+		log("список доменов не подключён к podkop: домены заработают после перезапуска podkop");
+		return;
+	}
+	for (let d in keys(db.domains))
+		apply_domain(d, true);
+}
+
+// trials of the previous run are not in the database, but podkop still routes them
+function drop_stale_trials() {
+	let l = null;
+	try { l = json(fs.readfile(TRIALS) ?? "[]"); } catch (e) {}
+	fs.unlink(TRIALS);
+	if (type(l) != "array")
+		return;
+	for (let ip in l) {
+		if (!parse_ip(ip) || db.added[ip] || db.tips[ip])
+			continue;
+		apply_live(ip, false, true);
+		fs.writefile(CONNTRACK, ip);
+	}
+}
+
+// a UDP server used to be added by its domain, which nothing checks or removes afterwards
+function drop_udp_domains() {
+	for (let d in keys(db.domains))
+		if (db.domains[d].proto == "udp" && db.domains[d].how == "auto")
+			del_domain(d, "серверы UDP теперь добавляются по адресу и проверяются пробой");
+}
+
+function ct_read() {
+	if (!ct_read_done) {
+		ct_text = fs.readfile(CONNTRACK);
+		ct_read_done = true;
+	}
+	return ct_text;
+}
+
+function read_set(name) {
+	let p = fs.popen(`nft -j list set inet autoadd ${name} 2>/dev/null`, "r");
+	if (!p)
+		return [];
+	let s = p.read("all");
+	p.close();
+	let j;
+	try { j = json(s); } catch (e) { return []; }
+	let res = [];
+	for (let o in j?.nftables) {
+		if (!o?.set?.elem)
+			continue;
+		for (let e in o.set.elem) {
+			let c = (e?.elem?.val ?? e)?.concat;
+			if (type(c) == "array" && length(c) == 2)
+				push(res, [ c[0], +c[1] ]);
+		}
+	}
+	if (length(res))
+		system([ "nft", "flush", "set", "inet", "autoadd", name ]);
+	return res;
+}
+
+function prune_cands() {
+	let now = time();
+	for (let k in keys(cands))
+		if (now - cands[k].last > 6 * 3600)
+			delete cands[k];
+	let ks = keys(cands);
+	if (length(ks) <= MAX_CANDS)
+		return;
+	ks = sort(ks, (a, b) => cands[a].last - cands[b].last);
+	for (let i = 0; i < length(ks) - MAX_CANDS; i++)
+		delete cands[ks[i]];
+}
+
+function touch_cand(ip, port, proto, kind, weight) {
+	if (!is_public(ip) || db.added[ip] || db.ignore[ip])
+		return;
+	let now = time();
+	let d = dom_of(ip);
+	// right after a domain is added devices still use the cached real address; later on
+	// a connection to it means the domain rule does not work and the address is needed
+	if (d && db.domains[d] && now - (db.domains[d].ts ?? 0) < DOMAIN_GRACE_SEC)
+		return;
+	// a cut-off transfer can only be checked by downloading from the site by name
+	if (kind == "cut" && !d)
+		return;
+	let k = (proto == "udp" ? "u/" : "") + ip + ":" + port;
+	let c = cands[k];
+	if (!c) {
+		c = cands[k] = { ip, port, proto, kind, first: now, hits: 0, next: 0, probed: 0,
+				 status: proto == "udp" ? "udp" : "new" };
+	}
+	c.hits += weight ?? 1;
+	c.last = now;
+	if ((kind == "stall" && c.kind != "stall") || (kind == "cut" && c.kind == "syn")) {
+		c.kind = kind;
+		c.next = 0;
+	}
+}
+
+function poll_sets() {
+	for (let e in read_set("cand_tcp"))
+		touch_cand(e[0], e[1], "tcp", "syn");
+	for (let e in read_set("cand_stall"))
+		touch_cand(e[0], e[1], "tcp", "stall");
+	for (let e in read_set("cand_cut"))
+		touch_cand(e[0], e[1], "tcp", "cut");
+	for (let e in read_set("cand_udp"))
+		touch_cand(e[0], e[1], "udp", "udp");
+	prune_cands();
+}
+
+// A browser does not close a throttled connection, it waits on it and the page stays
+// blank, so no FIN or RST reaches gf_stall. Such a connection is found in conntrack:
+// the answer stopped at 12-48 KB while the device keeps sending packets that get no reply
+function scan_frozen() {
+	if (!length(cfg.pcs))
+		return;
+	let s = ct_read();
+	if (s == null) {
+		if (!ct_missing)
+			log(`нет доступа к ${CONNTRACK}, зависшие соединения не отслеживаются`);
+		ct_missing = true;
+		return;
+	}
+	let now = time(), cur = {};
+	for (let line in split(s, "\n")) {
+		if (index(line, " ESTABLISHED ") < 0)
+			continue;
+		let m = match(line, / ESTABLISHED src=([0-9.]+) dst=([0-9.]+) sport=([0-9]+) dport=([0-9]+) packets=([0-9]+) bytes=[0-9]+ src=[0-9.]+ dst=[0-9.]+ sport=[0-9]+ dport=[0-9]+ packets=([0-9]+) bytes=([0-9]+) /);
+		if (!m || +m[7] < CUT_MIN || +m[7] > CUT_MAX || m[4] == "7680")
+			continue;
+		if (index(cfg.pcs, m[1]) < 0 || !is_public(m[2]))
+			continue;
+		let k = `${m[1]}:${m[3]}>${m[2]}:${m[4]}`;
+		let op = +m[5], rp = +m[6];
+		let f = flows[k];
+		if (!f || f.rp != rp) {
+			cur[k] = { op, rp, t: 0 };
+			continue;
+		}
+		cur[k] = f;
+		// a single late ACK of the device is not a sign, repeated packets are
+		if (f.done || op - f.op < 3)
+			continue;
+		if (!f.t) {
+			f.t = now;
+			continue;
+		}
+		f.done = true;
+		touch_cand(m[2], +m[4], "tcp", "cut", 2);
+	}
+	flows = cur;
+}
+
+// UDP cannot be probed from the router, the protocol of the game is unknown. A candidate
+// that stays unanswered is sent through podkop on trial; scan_udp then looks whether
+// the server answers there and takes the address back if it does not
+// Networks (/16) of the UDP destinations of every watched device and the devices behind
+// every destination. The servers of a game lie in a few networks, the peers of a torrent
+// client are scattered over dozens
+function udp_peers() {
+	let s = ct_read();
+	if (s == null)
+		return null;
+	let dev = {}, who = {};
+	for (let line in split(s, "\n")) {
+		if (index(line, " udp ") < 0)
+			continue;
+		let m = match(line, / udp +17 [0-9]+ src=([0-9.]+) dst=([0-9.]+) sport=[0-9]+ dport=([0-9]+) /);
+		if (!m || index(cfg.pcs, m[1]) < 0 || !is_public(m[2]))
+			continue;
+		if (m[3] == "53" || m[3] == "123" || m[3] == "443")
+			continue;
+		if (!dev[m[1]])
+			dev[m[1]] = {};
+		dev[m[1]][join(".", slice(split(m[2], "."), 0, 2))] = true;
+		if (!who[m[2]])
+			who[m[2]] = {};
+		who[m[2]][m[1]] = true;
+	}
+	return { dev, who };
+}
+
+// declared above its callers: ucode does not see a function declared further down
+function auto_allowed() {
+	let now = time();
+	auto_times = filter(auto_times, (t) => now - t < 3600);
+	return cfg.auto && length(auto_times) < MAX_AUTO_PER_HOUR && total_added() < MAX_ADDED;
+}
+
+function udp_trials() {
+	let now = time();
+	for (let ip in keys(udp_bad))
+		if (now - udp_bad[ip] > UDP_BAD_SEC)
+			delete udp_bad[ip];
+	for (let ip in keys(udp_wait))
+		if (now >= udp_wait[ip])
+			delete udp_wait[ip];
+	let trials = 0, peers = null, loaded = false;
+	for (let ip, e in db.added)
+		if (e.trial)
+			trials++;
+	for (let k in keys(cands)) {
+		let c = cands[k];
+		if (!c || c.proto != "udp")
+			continue;
+		if (udp_bad[c.ip]) {
+			c.status = "udp_bad";
+			continue;
+		}
+		if (udp_wait[c.ip]) {
+			c.status = "udp_wait";
+			continue;
+		}
+		if (!loaded) {
+			peers = udp_peers();
+			loaded = true;
+		}
+		let p2p = false;
+		let owners = peers ? peers.who[c.ip] : null;
+		if (owners && length(keys(owners))) {
+			for (let d in keys(owners))
+				if (length(peers.dev[d]) > UDP_PEERS)
+					p2p = true;
+		}
+		else {
+			for (let d in keys(peers?.dev ?? {}))
+				if (length(peers.dev[d]) > UDP_PEERS)
+					p2p = true;
+		}
+		if (p2p) {
+			c.status = "p2p";
+			continue;
+		}
+		c.status = "udp";
+		if (c.port == 53 || c.port == 123)
+			continue;
+		if (now - c.last > 120)
+			continue;
+		if (c.hits < UDP_HITS || now - c.first < UDP_MIN_SEC)
+			continue;
+		if (!auto_allowed() || trials >= UDP_TRIALS) {
+			c.status = "blocked";
+			continue;
+		}
+		push(auto_times, now);
+		trials++;
+		// always by address: only an address can be put on trial and taken back
+		add_ip(c.ip, { how: "auto", port: c.port, proto: "udp", ts: now, chk: now, trial: now,
+			       why: "UDP: напрямую сервер не отвечает, проверяется через прокси",
+			       name: name_of(c.ip, c.ptr) });
+	}
+}
+
+// A block may let the first packets through and cut the exchange later: the flow has
+// answers, so the nft rule for unanswered ones never sees it. Such a flow is found in
+// conntrack: the device keeps sending while the count of answers stands still
+function scan_udp_stall() {
+	if (!length(cfg.pcs))
+		return;
+	let s = ct_read();
+	if (s == null)
+		return;
+	let now = time(), cur = {};
+	for (let line in split(s, "\n")) {
+		if (index(line, " udp ") < 0 || index(line, "[UNREPLIED]") >= 0)
+			continue;
+		let m = match(line, / udp +17 [0-9]+ src=([0-9.]+) dst=([0-9.]+) sport=([0-9]+) dport=([0-9]+) packets=([0-9]+) bytes=[0-9]+ src=[0-9.]+ dst=[0-9.]+ sport=[0-9]+ dport=[0-9]+ packets=([0-9]+) /);
+		if (!m || +m[6] < 1 || index(cfg.pcs, m[1]) < 0 || !is_public(m[2]) || db.added[m[2]])
+			continue;
+		let port = +m[4];
+		if (port == 53 || port == 123 || port == 443 || port == 6969 || (port >= 6881 && port <= 6889))
+			continue;
+		let k = `${m[1]}:${m[3]}>${m[2]}:${m[4]}`;
+		let op = +m[5], rp = +m[6];
+		let f = uflows[k];
+		if (!f || f.rp != rp) {
+			cur[k] = { op, rp, t: now };
+			continue;
+		}
+		cur[k] = f;
+		if (f.done || op - f.op < UDP_STALL_PKTS || now - f.t < UDP_STALL_SEC)
+			continue;
+		f.done = true;
+		touch_cand(m[2], port, "udp", "udp", UDP_HITS);
+	}
+	uflows = cur;
+}
+
+function scan_udp() {
+	let now = time(), watch = {}, n = 0;
+	for (let ip, e in db.added)
+		if (e.proto == "udp") {
+			watch[ip] = e;
+			n++;
+		}
+	for (let ip in keys(udp_mute))
+		if (!watch[ip]?.trial)
+			delete udp_mute[ip];
+	for (let ip in keys(udp_base))
+		if (!watch[ip]?.trial)
+			delete udp_base[ip];
+	if (!n)
+		return;
+	let s = ct_read();
+	if (s == null)
+		return;
+	// the table of this tick was read before a trial added in it was switched to the proxy:
+	// its flows are the direct ones. They are remembered and do not confirm the trial
+	let ok = {}, mute = {}, fresh = {};
+	for (let ip, e in watch)
+		if (e.trial && !udp_base[ip]) {
+			udp_base[ip] = {};
+			fresh[ip] = true;
+		}
+	for (let line in split(s, "\n")) {
+		if (index(line, " udp ") < 0)
+			continue;
+		let m = match(line, / udp +17 [0-9]+ src=([0-9.]+) dst=([0-9.]+) sport=([0-9]+) dport=([0-9]+) packets=([0-9]+) bytes=[0-9]+ (.UNREPLIED. )?src=[0-9.]+ dst=[0-9.]+ sport=[0-9]+ dport=[0-9]+ packets=([0-9]+) /);
+		if (!m || !watch[m[2]] || index(cfg.pcs, m[1]) < 0)
+			continue;
+		let k = `${m[1]}:${m[3]}>${m[4]}`, rp = +m[7];
+		if (fresh[m[2]]) {
+			udp_base[m[2]][k] = rp;
+			continue;
+		}
+		// a flow that outlived the switch with the same count of answers got none since
+		if (rp >= 2 && !(watch[m[2]].trial && udp_base[m[2]]?.[k] == rp))
+			ok[m[2]] = true;
+		else if (+m[5] >= 6)
+			mute[m[2]] = true;
+	}
+	let dirty = false, confirmed = false;
+	for (let ip, e in watch) {
+		if (ok[ip]) {
+			delete udp_mute[ip];
+			if (e.trial) {
+				delete e.trial;
+				e.chk = now;
+				e.why = "UDP: напрямую сервер не отвечает, через прокси отвечает";
+				db.last = { id: ip, ip, port: e.port, name: e.name, how: e.how, ts: e.ts };
+				dirty = true;
+				confirmed = true;
+				log(`${ip}${e.port ? ":" + e.port : ""}${show_name(e.name)}: через прокси сервер отвечает, адрес оставлен`);
+			}
+			// the time of the last answer is written at most once a day to spare the flash
+			else if (now - (e.chk ?? 0) > 24 * 3600) {
+				e.chk = now;
+				dirty = true;
+			}
+			continue;
+		}
+		if (!e.trial) {
+			if (now - (e.chk ?? e.ts ?? 0) > UDP_IDLE_SEC)
+				del_ip(ip, "не использовался 7 дней");
+			continue;
+		}
+		if (mute[ip] && now - e.trial >= UDP_GRACE_SEC) {
+			udp_mute[ip] = (udp_mute[ip] ?? 0) + 1;
+			if (udp_mute[ip] >= UDP_MUTE_TICKS) {
+				delete udp_mute[ip];
+				udp_bad[ip] = now;
+				del_ip(ip, "через прокси сервер тоже не отвечает");
+			}
+		}
+		else if (now - e.trial > UDP_WAIT_SEC) {
+			udp_wait[ip] = now + UDP_RETRY_SEC;
+			del_ip(ip, "не подтверждён: устройство больше не обращалось к серверу");
+		}
+	}
+	if (dirty)
+		save_db();
+	if (confirmed)
+		save_list(false);
+}
+
+// targets: { "ip:port": site name or null }. With a name the probe downloads from the site
+// (SNI and Host are set), without it only the TLS handshake by bare address is checked
+function run_probe(targets, cb) {
+	probing = true;
+	let out = RUN + "/probe.out";
+	fs.unlink(out);
+	let args = [ out, cfg.proxy ];
+	for (let k, n in targets)
+		push(args, n ? k + ":" + n : k);
+	uloop.process(PROBE, args, {}, function(code) {
+		probing = false;
+		let res = {};
+		for (let line in split(fs.readfile(out) ?? "", "\n")) {
+			let f = split(trim(line), " ");
+			if (length(f) < 9)
+				continue;
+			let k = f[0] + ":" + f[1];
+			let r = { d_rc: +f[2], d_tc: +f[3], d_ac: +f[4], d_sz: +f[5], p_rc: +f[6], p_ac: +f[7], p_sz: +f[8],
+				  named: !!targets[k] };
+			// 45: no free local port for the direct probe. Nothing was sent, so nothing is known
+			if (r.d_rc == 45)
+				continue;
+			if (length(f) > 9 && f[9] != "-" && match(f[9], /^[0-9A-Za-z._-]{1,100}$/))
+				r.ptr = f[9];
+			r.direct_tcp = r.d_tc > 0 || r.d_rc == 7;
+			r.direct_tls = r.d_ac > 0;
+			r.direct_ok = r.named ? r.d_rc == 0 : r.direct_tls;
+			r.proxy_tls = r.p_rc == 0 && r.p_ac > 0;
+			r.proxy_answer = r.proxy_tls || r.p_rc == 35 || r.p_rc == 52 || r.p_rc == 56;
+			res[k] = r;
+		}
+		fs.unlink(out);
+		cb(res);
+	});
+}
+
+function judge(c, r) {
+	let now = time();
+	c.probed = now;
+	c.res = r.named ? `напрямую rc=${r.d_rc}, ${kb(r.d_sz)}; через прокси rc=${r.p_rc}, ${kb(r.p_sz)}`
+		: `напрямую rc=${r.d_rc}, через прокси rc=${r.p_rc}`;
+	if (r.ptr)
+		c.ptr = r.ptr;
+	let why = null;
+	if (r.direct_ok) {
+		c.status = "direct_ok";
+		c.next = now + 6 * 3600;
+	}
+	else if (r.named && r.proxy_tls && (!r.direct_tls || (r.d_sz < CUT_MAX &&
+	         (r.d_rc == 28 ? r.p_sz >= 2 * r.d_sz : r.p_sz >= r.d_sz + 8192))))
+		// same request by site name: fails directly, completes through the proxy.
+		// A direct transfer that got past CUT_MAX is just slow, not throttled.
+		// A direct timeout needs no 8 KB margin: a small page hangs the same way
+		why = !r.direct_tcp ? `напрямую нет соединения (rc=${r.d_rc}), через прокси сайт открывается`
+			: !r.direct_tls ? `TLS напрямую не проходит (rc=${r.d_rc}), через прокси сайт открывается`
+			: `передача напрямую обрывается на ${kb(r.d_sz)} (rc=${r.d_rc}), через прокси получено ${kb(r.p_sz)}`;
+	else if (r.direct_tls) {
+		c.status = "direct_ok";
+		c.next = now + 6 * 3600;
+	}
+	else if (r.proxy_tls && (!r.direct_tcp || c.kind == "stall"))
+		why = r.direct_tcp ? `соединение у ПК зависло, TLS напрямую не проходит (rc=${r.d_rc}), через прокси проходит`
+			: `напрямую нет соединения (rc=${r.d_rc}), TLS через прокси проходит`;
+	else if (r.proxy_tls) {
+		// TCP opens directly and the PC only lost a SYN: the router's SNI-less probe is not proof of a block
+		c.status = "suspect";
+		c.next = now + 3600;
+	}
+	else if (r.direct_tcp) {
+		c.status = "direct_ok";
+		c.next = now + 6 * 3600;
+	}
+	else if (r.named && r.proxy_answer && r.p_ac > 0 && !r.direct_tcp) {
+		// the TLS handshake through the proxy is required: without it (rc=35) the proxy
+		// got no further than a direct connection that only lost its SYN for a moment
+		why = `напрямую нет соединения (rc=${r.d_rc}), через прокси сервис отвечает`;
+	}
+	else if (r.proxy_answer) {
+		// no TLS through the proxy: cannot tell a game server from a torrent peer or a site
+		// that refuses the router's TLS on any route, leave to the user
+		c.status = "maybe";
+		c.next = now + 3600;
+	}
+	else {
+		c.status = "dead";
+		c.next = now + 3600;
+	}
+	if (!why)
+		return;
+	if (!auto_allowed()) {
+		c.status = "blocked";
+		c.why = why;
+		c.next = now + 600;
+		return;
+	}
+	push(auto_times, now);
+	let d = dom_of(c.ip);
+	if (d && !db.domains[d])
+		add_domain(d, { how: "auto", ip: c.ip, port: c.port, proto: "tcp", ts: now, chk: now, why });
+	else
+		add_ip(c.ip, { how: "auto", port: c.port, proto: "tcp", ts: now, chk: now,
+			       why: d ? why + "; правило по домену не помогло" : why, name: name_of(c.ip, c.ptr) });
+}
+
+function probe_cands() {
+	let now = time();
+	let t = {}, n = 0;
+	for (let k, c in cands) {
+		if (c.proto != "tcp" || c.next > now || c.last <= c.probed || (c.kind == "cut" && c.hits < 2 && !dom_of(c.ip) && now - c.first < 30))
+			continue;
+		t[k] = dom_of(c.ip);
+		if (++n >= BATCH)
+			break;
+	}
+	if (!n)
+		return false;
+	run_probe(t, function(res) {
+		for (let k in keys(t))
+			if (cands[k] && res[k])
+				judge(cands[k], res[k]);
+	});
+	return true;
+}
+
+// automatic entries are probed every RECHECK_SEC; an entry that answers directly
+// is probed once more in RECHECK_CONFIRM_SEC and then removed
+function recheck_added() {
+	let now = time();
+	let t = {}, items = [];
+	let take = function(dom, id, e, ip, name) {
+		if (length(items) >= BATCH || e.proto != "tcp" || !ip || !e.port)
+			return;
+		if (now - (e.chk ?? e.ts ?? 0) < RECHECK_SEC)
+			return;
+		let k = ip + ":" + e.port;
+		if (exists(t, k))
+			return;
+		t[k] = name;
+		push(items, { dom, id, k });
+	};
+	for (let d, e in db.domains)
+		take(true, d, e, e.ip, d);
+	for (let ip, e in db.added)
+		take(false, ip, e, ip, clean_domain(index(e.name ?? "ptr:", "ptr:") == 0 ? null : e.name));
+	if (!length(items))
+		return;
+	run_probe(t, function(res) {
+		let now = time();
+		for (let it in items) {
+			let e = it.dom ? db.domains[it.id] : db.added[it.id];
+			let r = res[it.k];
+			if (!e)
+				continue;
+			e.chk = now;
+			if (!r)
+				continue;
+			e.okd = r.direct_ok ? (e.okd ?? 0) + 1 : 0;
+			e.dead = (!r.direct_tls && !r.proxy_answer) ? (e.dead ?? 0) + 1 : 0;
+			let why = e.okd >= 2 ? "снова доступен напрямую" : e.dead >= 5 ? "не отвечает 5 проверок подряд" : null;
+			if (e.okd == 1)
+				e.chk = now - RECHECK_SEC + RECHECK_CONFIRM_SEC;
+			if (!why)
+				continue;
+			if (it.dom)
+				del_domain(it.id, why);
+			else
+				del_ip(it.id, why);
+		}
+		save_db();
+	});
+}
+
+function daily_log_reset() {
+	let day = localtime().yday;
+	if (day == log_day)
+		return;
+	log_day = day;
+	logbuf = [];
+	log("журнал очищен (раз в сутки)");
+}
+
+function check_table() {
+	let now = time();
+	if (now - last_table_check < 600)
+		return;
+	last_table_check = now;
+	system("sysctl -q -w net.netfilter.nf_conntrack_acct=1");
+	if (system("nft list chain inet autoadd gf_forward >/dev/null 2>&1") != 0) {
+		log("таблица nft autoadd пропала, создаю заново");
+		nft_setup();
+	}
+}
+
+function dns_subscribe() {
+	if (dns_ok)
+		return;
+	// dnsmasq publishes every answered A record on ubus; nothing is written to syslog
+	dns_sub ??= conn.subscriber(function(req) {
+		let d = req.data;
+		if (req.type != "dns_result" || d?.type != "A" || type(d.name) != "string" || !is_public(d.address))
+			return;
+		if (!match(d.name, /^[0-9A-Za-z._-]{1,100}$/))
+			return;
+		// behind a CNAME dnsmasq names the owner of the A record (a CDN host), not the site:
+		// keep the name the sniffer took from the question
+		let n = names[d.address];
+		if (n?.q)
+			n.t = time();
+		else
+			names[d.address] = { n: d.name, t: time() };
+	}, function() { dns_ok = false; });
+	dns_ok = dns_sub.subscribe("dnsmasq.dns") === true;
+}
+
+// name at off of DNS message p: [ name, offset behind it ]
+function dns_name(p, off) {
+	let out = [], n = length(p), hops = 0, end = -1;
+	while (true) {
+		if (off >= n)
+			return null;
+		let l = ord(p, off);
+		if (l == 0) {
+			off++;
+			break;
+		}
+		if ((l & 0xc0) == 0xc0) {
+			if (off + 1 >= n || ++hops > 10)
+				return null;
+			if (end < 0)
+				end = off + 2;
+			off = ((l & 0x3f) << 8) | ord(p, off + 1);
+			continue;
+		}
+		if (l > 63 || off + 1 + l > n)
+			return null;
+		push(out, substr(p, off + 1, l));
+		off += 1 + l;
+	}
+	return [ join(".", out), end < 0 ? off : end ];
+}
+
+// pkt: IPv4 packet with a DNS answer. Every A record in it gets the name that was asked for
+function dns_answer(pkt) {
+	let p = substr(pkt, (ord(pkt, 0) & 15) * 4 + 8);
+	let n = length(p);
+	if (n < 17 || (ord(p, 2) & 0x80) == 0 || (ord(p, 3) & 15) != 0)
+		return;
+	let an = (ord(p, 6) << 8) | ord(p, 7);
+	if (((ord(p, 4) << 8) | ord(p, 5)) != 1 || an < 1)
+		return;
+	let q = dns_name(p, 12);
+	if (!q || !match(q[0], /^[0-9A-Za-z._-]{1,100}$/))
+		return;
+	let off = q[1];
+	if (off + 4 > n || ((ord(p, off) << 8) | ord(p, off + 1)) != 1)
+		return;
+	off += 4;
+	for (let i = 0; i < an && i < 40; i++) {
+		let r = dns_name(p, off);
+		if (!r || r[1] + 10 > n)
+			return;
+		off = r[1];
+		let rt = (ord(p, off) << 8) | ord(p, off + 1), rl = (ord(p, off + 8) << 8) | ord(p, off + 9);
+		off += 10;
+		if (off + rl > n)
+			return;
+		if (rt == 1 && rl == 4) {
+			let ip = sprintf("%d.%d.%d.%d", ord(p, off), ord(p, off + 1), ord(p, off + 2), ord(p, off + 3));
+			if (is_public(ip))
+				names[ip] = { n: q[0], t: time(), q: true };
+		}
+		off += rl;
+	}
+}
+
+// dnsmasq forwards every query to podkop at 127.0.0.42 and reports only the last name of
+// a CNAME chain. The answers themselves carry the name the device asked for, so a raw UDP
+// socket bound and connected to that pair of addresses reads them next to dnsmasq
+function sniff_start() {
+	if (sniff || !socket || time() < sniff_next)
+		return;
+	sniff_next = time() + 300;
+	let s = socket.create(socket.AF_INET, socket.SOCK_RAW | socket.SOCK_NONBLOCK, 17);
+	if (!s?.bind({ family: socket.AF_INET, address: "127.0.0.1", port: 0 }) ||
+	    !s.connect({ family: socket.AF_INET, address: "127.0.0.42", port: 0 })) {
+		if (!sniff_said)
+			log(`не удалось слушать ответы DNS podkop (${socket.error()}): имена сайтов за CDN будут неточными`);
+		sniff_said = true;
+		s?.close();
+		return;
+	}
+	sniff = s;
+	sniff_handle = uloop.handle(s, function() {
+		for (let i = 0; i < 64; i++) {
+			let pkt = sniff.recv(4096);
+			if (!pkt)
+				break;
+			try { dns_answer(pkt); } catch (e) { warn(`autoaddd: dns_answer: ${e}\n`); }
+		}
+	}, uloop.ULOOP_READ);
+}
+
+function ver_newer(a, b) {
+	let x = split(a, "."), y = split(b, ".");
+	for (let i = 0; i < 4; i++) {
+		let d = +(x[i] ?? 0) - +(y[i] ?? 0);
+		if (d != 0)
+			return d > 0;
+	}
+	return false;
+}
+
+function run_update() {
+	if (upd.state != "idle")
+		return false;
+	upd.state = "installing";
+	upd.error = null;
+	log("обновление: устанавливаю " + (upd.latest ? "версию " + upd.latest : "последнюю версию"));
+	// the installer restarts this service, so the callback runs only when it stopped earlier
+	uloop.process(UPDATER, [ "install" ], {}, function(code) {
+		upd.state = "idle";
+		if (code != 0) {
+			upd.error = `установка не удалась (код ${code}), подробности в ${RUN}/update.log`;
+			log("обновление: " + upd.error);
+		}
+	});
+	return true;
+}
+
+// manual: asked from the page, so the result goes to the journal even when nothing changed
+function check_update(manual) {
+	if (upd.state != "idle")
+		return false;
+	upd.state = "checking";
+	upd.next = time() + UPDATE_CHECK_SEC;
+	let out = RUN + "/latest";
+	uloop.process(UPDATER, [ "check", out ], {}, function(code) {
+		upd.state = "idle";
+		upd.checked = time();
+		let v = trim(fs.readfile(out) ?? "");
+		fs.unlink(out);
+		if (!match(v, /^[0-9]+(\.[0-9]+){1,3}$/)) {
+			upd.error = "не удалось узнать версию на GitHub";
+			if (manual)
+				log("обновление: " + upd.error);
+			return;
+		}
+		upd.error = null;
+		let was = upd.latest;
+		upd.latest = v;
+		if (!ver_newer(v, VERSION)) {
+			if (manual)
+				log(`обновление: установлена последняя версия ${VERSION}`);
+			return;
+		}
+		if (manual || was != v)
+			log(`обновление: доступна версия ${v}, установлена ${VERSION}`);
+		if (cfg.autoupdate && !manual)
+			run_update();
+	});
+	return true;
+}
+
+function tick() {
+	ct_read_done = false;
+	ct_text = null;
+	daily_log_reset();
+	check_table();
+	dns_subscribe();
+	sniff_start();
+	prune_names();
+	expire_tips();
+	poll_sets();
+	try { scan_frozen(); } catch (e) { warn(`autoaddd: scan_frozen: ${e}\n`); }
+	try { scan_udp_stall(); udp_trials(); scan_udp(); } catch (e) { warn(`autoaddd: udp: ${e}\n`); }
+	if (!probing && !probe_cands())
+		recheck_added();
+	if (upd.state == "idle" && time() >= upd.next)
+		check_update(false);
+}
+
+// all / all_added lift the SHOW_ROWS limit of the candidate and added tables
+function status(all, all_added) {
+	let cl = [];
+	for (let k, c in cands)
+		if (all || (c.status != "direct_ok" && c.status != "dead" && c.status != "udp_bad" && c.status != "udp_wait"))
+			push(cl, { ...c, name: name_of(c.ip, c.ptr) });
+	let cands_shown = length(cl);
+	cl = slice(sort(cl, (a, b) => (b.first - a.first) || (a.ip < b.ip ? -1 : 1) || (a.port - b.port)), 0, all ? 300 : SHOW_ROWS);
+	let al = [];
+	for (let ip, e in db.added)
+		push(al, { id: ip, ...e, name: e.name ?? name_of(ip, null) });
+	for (let d, e in db.domains)
+		push(al, { id: d, dom: true, ...e });
+	al = sort(al, (a, b) => ((b.ts ?? 0) - (a.ts ?? 0)) || (a.id < b.id ? -1 : 1));
+	let last = db.last ? { ...db.last } : null;
+	if (last) {
+		last.id ??= last.ip;
+		last.active = !!(db.added[last.id] || db.domains[last.id]);
+	}
+	return {
+		now: time(), started, version: VERSION,
+		update: { latest: upd.latest, available: !!upd.latest && ver_newer(upd.latest, VERSION), checked: upd.checked,
+			  state: upd.state, error: upd.error, auto: cfg.autoupdate },
+		auto: cfg.auto, pcs: cfg.pcs, probing,
+		cands_total: length(cands), cands_shown, names_total: length(names),
+		added_total: length(al), added: all_added ? al : slice(al, 0, SHOW_ROWS), cands: cl,
+		ignore: sort(keys(db.ignore)), last, log: logbuf
+	};
+}
+
+function clean_note(s) {
+	if (type(s) != "string" || length(s) > 120)
+		return "";
+	return replace(s, /[[:cntrl:]]/g, "");
+}
+
+function m_add(a) {
+	let ip = type(a?.ip) == "string" ? trim(a.ip) : "";
+	let now = time();
+	let meta = { how: "manual", ts: now, why: clean_note(a?.note) || "добавлен вручную" };
+	if (total_added() >= MAX_ADDED)
+		return { ok: false, error: "достигнут предел записей" };
+	if (!parse_ip(ip)) {
+		let d = clean_domain(ip);
+		if (!d)
+			return { ok: false, error: "нужен публичный IPv4-адрес или домен" };
+		if (db.domains[d])
+			return { ok: false, error: "уже добавлен" };
+		add_domain(d, meta);
+		return { ok: true };
+	}
+	if (!is_public(ip))
+		return { ok: false, error: "нужен публичный IPv4-адрес или домен" };
+	if (db.added[ip])
+		return { ok: false, error: "уже добавлен" };
+	if (names[ip])
+		meta.name = names[ip].n;
+	for (let k, c in cands)
+		if (c.ip == ip) {
+			meta.port = c.port;
+			meta.proto = c.proto;
+			meta.name ??= name_of(ip, c.ptr);
+			break;
+		}
+	// a candidate with a known site name is added by domain
+	let d = a?.domain ? dom_of(ip) : null;
+	if (d && !db.domains[d]) {
+		delete meta.name;
+		meta.ip = ip;
+		add_domain(d, meta);
+		return { ok: true };
+	}
+	if (!meta.name) {
+		let ptr = ptr_lookup(ip);
+		if (ptr)
+			meta.name = "ptr:" + ptr;
+	}
+	if (db.ignore[ip])
+		delete db.ignore[ip];
+	add_ip(ip, meta);
+	return { ok: true };
+}
+
+function m_del(a) {
+	let id = a?.ip;
+	if (type(id) != "string")
+		return { ok: false, error: "нет такой записи" };
+	if (parse_ip(id) && db.added[id])
+		del_ip(id, "удалён вручную");
+	else if (exists(db.domains, id))
+		del_domain(id, "удалён вручную");
+	else
+		return { ok: false, error: "нет такой записи" };
+	return { ok: true };
+}
+
+function m_ignore(a, on) {
+	let ip = a?.ip;
+	if (!parse_ip(ip))
+		return { ok: false, error: "неверный адрес" };
+	if (on) {
+		if (length(db.ignore) >= MAX_ADDED)
+			return { ok: false, error: "достигнут предел записей" };
+		db.ignore[ip] = time();
+		drop_cands(ip);
+		log(`${ip}: в списке игнорируемых`);
+	}
+	else
+		delete db.ignore[ip];
+	save_db();
+	return { ok: true };
+}
+
+function m_set_auto(a) {
+	cfg.auto = !!a?.auto;
+	let c = uci.cursor();
+	c.set("autoadd", "main", "auto", cfg.auto ? "1" : "0");
+	c.commit("autoadd");
+	log("автодобавление " + (cfg.auto ? "включено" : "выключено"));
+	return { ok: true };
+}
+
+function lan_info() {
+	let c = uci.cursor();
+	let a = c.get("network", "lan", "ipaddr");
+	if (type(a) == "array")
+		a = a[0];
+	let ip = a, bits = 24;
+	let m = match(a ?? "", /^([0-9.]+)\/([0-9]{1,2})$/);
+	if (m) {
+		ip = m[1];
+		bits = +m[2];
+	}
+	else {
+		let mo = parse_ip(c.get("network", "lan", "netmask"));
+		if (mo) {
+			let v = (mo[0] << 24) | (mo[1] << 16) | (mo[2] << 8) | mo[3];
+			bits = 0;
+			for (let i = 31; i >= 0 && (v & (1 << i)); i--)
+				bits++;
+		}
+	}
+	let o = parse_ip(ip);
+	if (!o || bits < 8 || bits > 30)
+		return null;
+	return { ip, bits, n: (o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3] };
+}
+
+function in_lan(lan, ip) {
+	let o = parse_ip(ip);
+	if (!o)
+		return false;
+	let n = (o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3];
+	let sh = 32 - lan.bits, host = n & ((1 << sh) - 1);
+	return (n >> sh) == (lan.n >> sh) && n != lan.n && host != 0 && host != (1 << sh) - 1;
+}
+
+function is_mac(m) {
+	return type(m) == "string" && match(m, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/) != null;
+}
+
+function dhcp_hosts(c) {
+	let r = [];
+	c.foreach("dhcp", "host", function(s) {
+		let macs = type(s.mac) == "array" ? s.mac : split(trim(s.mac ?? ""), /[ \t]+/);
+		push(r, { sec: s[".name"], macs: filter(map(macs, (m) => lc(m)), is_mac),
+			  ip: parse_ip(s.ip) ? s.ip : null, name: s.name ?? null });
+	});
+	return r;
+}
+
+function dhcp_leases() {
+	let r = [];
+	for (let line in split(fs.readfile(LEASES) ?? "", "\n")) {
+		let f = split(trim(line), /[ \t]+/);
+		if (length(f) < 4 || !is_mac(lc(f[1])) || !parse_ip(f[2]))
+			continue;
+		push(r, { mac: lc(f[1]), ip: f[2], name: match(f[3], /^[0-9A-Za-z._-]{1,63}$/) ? f[3] : null });
+	}
+	return r;
+}
+
+function set_pcs(pcs) {
+	cfg.pcs = pcs;
+	let c = uci.cursor();
+	if (length(pcs))
+		c.set("autoadd", "main", "pc", pcs);
+	else
+		c.delete("autoadd", "main", "pc");
+	c.commit("autoadd");
+	let cmd = "flush set inet autoadd pcs\n";
+	if (length(pcs))
+		cmd += `add element inet autoadd pcs { ${join(", ", pcs)} }\n`;
+	fs.writefile(RUN + "/pcs.nft", cmd);
+	if (system([ "nft", "-f", RUN + "/pcs.nft" ]) != 0)
+		nft_setup();
+}
+
+function m_devices() {
+	let by = {}, seen = {};
+	for (let h in dhcp_hosts(uci.cursor()))
+		for (let mac in h.macs)
+			by[mac] = { mac, name: h.name, static: true, static_ip: h.ip, lease_ip: null };
+	for (let l in dhcp_leases()) {
+		let d = by[l.mac] ??= { mac: l.mac, name: null, static: false, static_ip: null, lease_ip: null };
+		d.lease_ip = l.ip;
+		d.name ??= l.name;
+	}
+	let list = [];
+	for (let mac, d in by) {
+		d.ip = d.static_ip ?? d.lease_ip;
+		d.watch = false;
+		for (let ip in [ d.static_ip, d.lease_ip ])
+			if (ip) {
+				seen[ip] = true;
+				if (index(cfg.pcs, ip) >= 0)
+					d.watch = true;
+			}
+		if (d.ip)
+			push(list, d);
+	}
+	for (let ip in cfg.pcs)
+		if (!seen[ip])
+			push(list, { mac: null, name: null, static: false, static_ip: null, lease_ip: null, ip, watch: true });
+	let num = (ip) => { let o = parse_ip(ip); return (o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3]; };
+	list = sort(list, (a, b) => (b.watch - a.watch) || (b.static - a.static) || (num(a.ip) - num(b.ip)));
+	let lan = lan_info();
+	return { ok: true, devices: slice(list, 0, 300), lan: lan ? `${lan.ip}/${lan.bits}` : null };
+}
+
+function m_set_device(a) {
+	let ip = a?.ip, watch = !!a?.watch, st = !!a?.static || watch;
+	let mac = type(a?.mac) == "string" && a.mac != "" ? lc(a.mac) : null;
+	if (!mac) {
+		if (watch || !parse_ip(ip))
+			return { ok: false, error: "у устройства нет MAC-адреса, его можно только снять с отслеживания" };
+		set_pcs(filter(cfg.pcs, (x) => x != ip));
+		log(`${ip}: снят с отслеживания`);
+		return { ok: true };
+	}
+	if (!is_mac(mac))
+		return { ok: false, error: "неверный MAC-адрес" };
+	let lan = lan_info();
+	if (!lan)
+		return { ok: false, error: "не удалось определить локальную сеть" };
+	if (!in_lan(lan, ip))
+		return { ok: false, error: `адрес должен быть из сети ${lan.ip}/${lan.bits} и не совпадать с адресом роутера` };
+	let name = type(a?.name) == "string" ? a.name : "";
+	if (name != "" && !match(name, /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/))
+		return { ok: false, error: "имя: латиница, цифры и дефис, до 63 знаков" };
+
+	let c = uci.cursor();
+	let hosts = dhcp_hosts(c), leases = dhcp_leases(), mine = null;
+	for (let h in hosts)
+		if (index(h.macs, mac) >= 0) {
+			mine = h;
+			break;
+		}
+	for (let h in hosts) {
+		if (h === mine)
+			continue;
+		if (h.ip == ip)
+			return { ok: false, error: `адрес ${ip} уже закреплён за другим устройством` };
+		if (st && name != "" && h.name && lc(h.name) == lc(name))
+			return { ok: false, error: `имя ${name} уже занято устройством ${join(", ", h.macs)} (${h.ip ?? "без адреса"}): снимите с него закрепление или задайте другое имя` };
+	}
+	let old = [];
+	if (mine?.ip)
+		push(old, mine.ip);
+	for (let l in leases) {
+		if (l.mac == mac)
+			push(old, l.ip);
+		else if (l.ip == ip)
+			return { ok: false, error: `адрес ${ip} сейчас выдан устройству ${l.mac}` };
+	}
+	let pcs = filter(cfg.pcs, (x) => index(old, x) < 0 && x != ip);
+	if (watch)
+		push(pcs, ip);
+	if (length(pcs) > MAX_PCS)
+		return { ok: false, error: "слишком много отслеживаемых устройств" };
+
+	let changed = false;
+	if (st) {
+		let sec = mine?.sec;
+		if (!sec) {
+			sec = c.add("dhcp", "host");
+			c.set("dhcp", sec, "mac", mac);
+			changed = true;
+		}
+		if (mine?.ip != ip) {
+			c.set("dhcp", sec, "ip", ip);
+			changed = true;
+		}
+		if (name != "" && mine?.name != name) {
+			c.set("dhcp", sec, "name", name);
+			changed = true;
+		}
+	}
+	else if (mine) {
+		if (length(mine.macs) > 1)
+			return { ok: false, error: "в записи DHCP несколько MAC-адресов, правьте её в Network → DHCP and DNS" };
+		c.delete("dhcp", mine.sec);
+		changed = true;
+	}
+	if (changed) {
+		c.commit("dhcp");
+		system([ "/etc/init.d/dnsmasq", "reload" ]);
+	}
+	set_pcs(pcs);
+	log(`${mac} ${ip}: ${st ? "адрес закреплён" : "адрес не закреплён"}, ${watch ? "отслеживается" : "не отслеживается"}`);
+	return { ok: true };
+}
+
+fs.mkdir(RUN);
+load_cfg();
+load_db();
+if (!fs.stat(LIST))
+	save_list(false);
+if (!fs.stat(DLIST))
+	save_list(true);
+function m_check_update() {
+	if (!check_update(true))
+		return { ok: false, error: "Проверка или установка уже идёт" };
+	return { ok: true };
+}
+
+function m_update() {
+	if (!run_update())
+		return { ok: false, error: "Проверка или установка уже идёт" };
+	return { ok: true };
+}
+
+function m_set_autoupdate(a) {
+	cfg.autoupdate = !!a?.auto;
+	let c = uci.cursor();
+	c.set("autoadd", "main", "autoupdate", cfg.autoupdate ? "1" : "0");
+	c.commit("autoadd");
+	log("автообновление " + (cfg.autoupdate ? "включено" : "выключено"));
+	if (cfg.autoupdate && upd.state == "idle")
+		upd.next = time();
+	return { ok: true };
+}
+
+system("sysctl -q -w net.netfilter.nf_conntrack_acct=1");
+nft_setup();
+drop_stale_trials();
+sync_all();
+drop_udp_domains();
+log(`запущен, версия ${VERSION}, наблюдаю за: ${join(", ", cfg.pcs)}`);
+uci.cursor().foreach("firewall", "defaults", function(s) {
+	// an offloaded flow bypasses the forward hook and may stop updating its conntrack counters
+	if (s.flow_offloading == "1")
+		log("в firewall включён flow offloading: обрыв уже начавшегося обмена (TCP на 12–48 КБ, UDP после первых ответов) может не отслеживаться");
+});
+if (!socket)
+	log("нет пакета ucode-mod-socket: имена сайтов за CDN будут неточными");
+
+uloop.init();
+
+conn = ubus.connect();
+conn.publish("autoadd", {
+	status: { call: (req) => status(req.args?.all, req.args?.all_added), args: { ubus_rpc_session: "", all: false, all_added: false } },
+	add: { call: (req) => m_add(req.args), args: { ubus_rpc_session: "", ip: "", note: "", domain: false } },
+	del: { call: (req) => m_del(req.args), args: { ubus_rpc_session: "", ip: "" } },
+	ignore: { call: (req) => m_ignore(req.args, true), args: { ubus_rpc_session: "", ip: "" } },
+	unignore: { call: (req) => m_ignore(req.args, false), args: { ubus_rpc_session: "", ip: "" } },
+	devices: { call: (req) => m_devices(), args: { ubus_rpc_session: "" } },
+	set_device: { call: (req) => m_set_device(req.args), args: { ubus_rpc_session: "", mac: "", ip: "", name: "", static: true, watch: true } },
+	set_auto: { call: (req) => m_set_auto(req.args), args: { ubus_rpc_session: "", auto: true } },
+	check_update: { call: (req) => m_check_update(), args: { ubus_rpc_session: "" } },
+	update: { call: (req) => m_update(), args: { ubus_rpc_session: "" } },
+	set_autoupdate: { call: (req) => m_set_autoupdate(req.args), args: { ubus_rpc_session: "", auto: true } }
+});
+
+let timer;
+timer = uloop.timer(TICK_MS, function() {
+	try { tick(); }
+	catch (e) { log("ошибка: " + e); }
+	timer.set(TICK_MS);
+});
+
+uloop.run();

@@ -1,0 +1,90 @@
+#!/bin/sh
+# autoadd-probe OUT PROXY ip:port[:name]...
+# line per target: ip port d_rc d_tc d_ac d_sz p_rc p_ac p_sz ptr
+# direct probe leaves from ports 61000-61063, which nft marks to bypass podkop
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+out="$1"; proxy="$2"; shift 2
+tmp="$out.d"
+rm -rf "$tmp"; mkdir -p "$tmp" || exit 1
+
+# fetch FILE curl-args...
+# prints "rc time_connect time_appconnect bytes" summed over all transfers of one curl run
+fetch() {
+	ff="$1"; shift
+	curl -k -s -o /dev/null --fail-early -w '%{time_connect} %{time_appconnect} %{size_download}\n' \
+		"$@" > "$ff" 2>/dev/null
+	frc=$?
+	echo "$frc $(awk '{ if ($1 > tc) tc = $1; if ($2 > ac) ac = $2; sz += $3 }
+		END { printf "%s %s %d", tc + 0, ac + 0, sz }' "$ff")"
+}
+
+# load FILE curl-args...
+# fetches the front page of $name. Throttling cuts a connection only after 16-25 KB
+# have arrived, so a small answer is requested again over a single connection
+# until about 40 KB are received
+load() {
+	lf="$1"; shift
+	lr=$(fetch "$lf" "$@" "https://$name:$port/")
+	lrc="${lr%% *}"; lsz="${lr##* }"; ltm="${lr#* }"; ltm="${ltm% *}"
+	if [ "$lrc" = 0 ] && [ "$lsz" -lt 32000 ]; then
+		ln=$((40000 / (lsz + 700) + 1))
+		[ "$ln" -le 20 ] || ln=20
+		lr=$(fetch "$lf" "$@" "https://$name:$port/?[1-$ln]")
+		lrc="${lr%% *}"; lsz="${lr##* }"
+	fi
+	echo "$lrc $ltm $lsz"
+}
+
+probe() {
+	ip="${1%%:*}"; rest="${1#*:}"; port="${rest%%:*}"; name=""
+	case "$rest" in *:*) name="${rest#*:}" ;; esac
+	key="$ip:$port"
+	(
+		if [ -n "$name" ]; then
+			r=$(load "$tmp/$key.pw" -x "$proxy" --resolve "$name:$port:$ip" --connect-timeout 5 -m 8)
+		else
+			r=$(fetch "$tmp/$key.pw" -x "$proxy" --connect-timeout 5 -m 8 "https://$ip:$port/")
+		fi
+		echo "$r" > "$tmp/$key.p"
+	) &
+	if [ -z "$name" ]; then
+		(
+			nslookup -timeout=2 -retry=1 "$ip" 127.0.0.1 2>/dev/null | sed -n 's/.*name = //p' | head -n 1 \
+				| tr -cd '0-9A-Za-z._-' > "$tmp/$key.n"
+		) &
+	fi
+	n=0
+	while :; do
+		if [ -n "$name" ]; then
+			r=$(load "$tmp/$key.dw" --local-port 61000-61063 --resolve "$name:$port:$ip" --connect-timeout 4 -m 6)
+		else
+			r=$(fetch "$tmp/$key.dw" --local-port 61000-61063 --connect-timeout 4 -m 6 "https://$ip:$port/")
+		fi
+		n=$((n + 1))
+		case "${r%% *}" in 0|7) break ;; esac
+		[ "$n" -ge 2 ] && break
+		sleep 1
+	done
+	# shellcheck disable=SC2086
+	set -- $r
+	rc="$1"; tc="$2"; ac="$3"; sz="$4"
+	# curl reports time_connect=0 when the TLS handshake times out, so ask for plain TCP separately
+	if [ "$rc" != 7 ] && [ "$ac" = 0 ]; then
+		tc=$(curl -s -o /dev/null --local-port 61000-61063 --connect-timeout 3 -m 4 \
+			-w '%{time_connect}' "http://$ip:$port/" 2>/dev/null)
+		tc="${tc:-0}"
+	fi
+	wait
+	p=$(cat "$tmp/$key.p" 2>/dev/null)
+	[ -n "$p" ] || p="28 0 0 0"
+	# shellcheck disable=SC2086
+	set -- $p
+	ptr=$(cat "$tmp/$key.n" 2>/dev/null)
+	echo "$ip $port $rc $tc $ac $sz $1 $3 $4 ${ptr:--}" > "$tmp/$key.r"
+}
+
+for t in "$@"; do probe "$t" & done
+wait
+cat "$tmp"/*.r > "$out.new" 2>/dev/null
+mv "$out.new" "$out"
+rm -rf "$tmp"

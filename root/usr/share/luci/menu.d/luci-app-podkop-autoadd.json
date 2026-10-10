@@ -1,0 +1,13 @@
+{
+	"admin/services/autoadd": {
+		"title": "Podkop AutoAdd",
+		"order": 43,
+		"action": {
+			"type": "view",
+			"path": "autoadd/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-podkop-autoadd" ]
+		}
+	}
+}

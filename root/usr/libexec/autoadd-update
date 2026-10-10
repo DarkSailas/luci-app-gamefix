@@ -1,0 +1,46 @@
+#!/bin/sh
+# Update helper of luci-app-podkop-autoadd, started by autoaddd.
+#
+#   autoadd-update check OUT   writes the version published on GitHub to OUT
+#   autoadd-update install     downloads the installer and runs it
+#
+# GitHub is fetched directly first and through the podkop proxy if that fails.
+
+REPO_BASE="https://raw.githubusercontent.com/DarkSailas/luci-app-podkop-autoadd/main"
+RUN="/tmp/autoadd"
+LOG="$RUN/update.log"
+PROXY="$(uci -q get autoadd.main.proxy)"
+
+# fetch URL FILE
+fetch() {
+	curl -fsSL --connect-timeout 10 --max-time 60 "$1" -o "$2" 2>/dev/null && [ -s "$2" ] && return 0
+	[ -n "$PROXY" ] || return 1
+	curl -fsSL --connect-timeout 10 --max-time 60 -x "$PROXY" "$1" -o "$2" 2>/dev/null && [ -s "$2" ]
+}
+
+mkdir -p "$RUN"
+
+case "$1" in
+check)
+	[ -n "$2" ] || exit 2
+	rm -f "$2"
+	fetch "$REPO_BASE/Makefile" "$RUN/Makefile.remote" || exit 1
+	ver="$(sed -n 's/^PKG_VERSION:=\([0-9][0-9.]*\)[[:space:]]*$/\1/p' "$RUN/Makefile.remote" | head -n 1)"
+	rm -f "$RUN/Makefile.remote"
+	[ -n "$ver" ] || exit 1
+	echo "$ver" > "$2"
+	;;
+install)
+	# the installer restarts autoaddd, which is the parent of this script
+	trap '' HUP TERM PIPE
+	exec >"$LOG" 2>&1 </dev/null
+	fetch "$REPO_BASE/install.sh" "$RUN/install.sh" || { echo "!!! Download failed: $REPO_BASE/install.sh"; exit 1; }
+	AUTOADD_PROXY="$PROXY" sh "$RUN/install.sh"
+	rc=$?
+	rm -f "$RUN/install.sh"
+	exit $rc
+	;;
+*)
+	exit 2
+	;;
+esac

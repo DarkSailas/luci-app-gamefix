@@ -1,0 +1,17 @@
+{
+	"luci-app-podkop-autoadd": {
+		"description": "Grant access to Podkop AutoAdd",
+		"read": {
+			"ubus": {
+				"autoadd": [ "status", "devices" ]
+			},
+			"uci": [ "autoadd" ]
+		},
+		"write": {
+			"ubus": {
+				"autoadd": [ "add", "del", "ignore", "unignore", "set_auto", "set_device", "check_update", "update", "set_autoupdate" ]
+			},
+			"uci": [ "autoadd" ]
+		}
+	}
+}
