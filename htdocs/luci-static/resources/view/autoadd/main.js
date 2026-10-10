@@ -18,7 +18,7 @@ var callUpdate = rpc.declare({ object: 'autoadd', method: 'update', expect: { ''
 var callSetAutoupdate = rpc.declare({ object: 'autoadd', method: 'set_autoupdate', params: [ 'auto' ], expect: { '': {} } });
 
 // must match VERSION in /usr/sbin/autoaddd: a mismatch means the browser runs a cached copy of this file
-var VIEW_VERSION = '3.0.8';
+var VIEW_VERSION = '3.0.9';
 var RELOAD_KEY = 'autoadd.reload';
 
 // short label and colour of a candidate status; the full text goes below it
@@ -552,8 +552,11 @@ return view.extend({
 			return E('div', { 'class': 'alert-message warning' },
 				'Служба autoadd не запущена: /etc/init.d/autoadd start');
 
+		// the service must have watched for a day before silence means anything
+		var watched = st.now - st.started >= 86400;
 		var added = (st.added || []).map(function(e) {
 			var port = e.port ? ':' + e.port : '';
+			var idle = watched && e.how != 'auto' && st.now - (e.use || e.ts || 0) > 7 * 86400;
 			return [
 				e.dom ? [
 					E('div', { 'class': 'aa-main' }, e.id),
@@ -565,7 +568,8 @@ return view.extend({
 				E('div', { 'class': 'aa-pills' }, [
 					pill(e.dom ? 'домен' : 'адрес', e.dom ? 'ok' : 'addr', e.dom ? 'Через прокси идёт весь домен с поддоменами' : 'Через прокси идёт только этот адрес'),
 					pill((e.proto || 'tcp').toUpperCase(), e.proto == 'udp' ? 'warn' : '', 'Протокол передачи'),
-					pill(e.how == 'auto' ? 'авто' : 'вручную', '', e.how == 'auto' ? 'Добавлено службой' : 'Добавлено вами, перепроверяется на доступность')
+					pill(e.how == 'auto' ? 'авто' : 'вручную', '', e.how == 'auto' ? 'Добавлено службой' : 'Добавлено вами, перепроверяется на доступность'),
+					idle ? pill('не используется', 'warn', (e.use ? 'Последнее обращение устройств: ' + fmtTime(e.use) : 'Обращений устройств служба не видела') + '. Запись добавлена вами и сама по сроку не удалится') : ''
 				]),
 				fmtWhy(e.why),
 				fmtShort(e.ts),
@@ -662,7 +666,7 @@ return view.extend({
 			self.section('added', 'Через прокси', [
 				E('div', { 'class': 'aa-bar' }, [
 					E('span', { 'class': 'aa-hint', 'style': 'flex:1 1 20em' },
-						'Домены и адреса, которые направляются через podkop. Все записи (включая добавленные вручную) перепроверяются каждые 6 часов и удаляются, если снова доступны напрямую. Серверы UDP (игры/голос) добавляются на пробу: без ответа удаляются через 3 минуты. Адрес, добавленный службой, удаляется, если к нему 7 дней никто не обращался.'),
+						'Домены и адреса, которые направляются через podkop. Все записи (включая добавленные вручную) перепроверяются каждые 6 часов и удаляются, если снова доступны напрямую. Серверы UDP (игры/голос) добавляются на пробу: без ответа удаляются через 3 минуты. Запись, добавленная службой, удаляется, если ею 7 дней никто не пользовался: к адресу не было соединений, имена домена не запрашивались. Записи, добавленные вручную, по сроку не удаляются, у неиспользуемых появляется пометка. Адрес самого прокси-сервера podkop не добавляется.'),
 					addedMore ? btn(self.showAllAdded ? 'Только последние' : 'Показать все', 'cbi-button-neutral', function() {
 						self.showAllAdded = !self.showAllAdded;
 						return self.refresh();

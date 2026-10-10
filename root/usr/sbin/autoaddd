@@ -11,7 +11,7 @@ let uci = require("uci");
 let socket = null;
 try { socket = require("socket"); } catch (e) {}
 
-const VERSION = "3.0.8";
+const VERSION = "3.0.9";
 // the daemon takes no arguments. A copy started by hand next to the service flushes the same
 // nft sets and wipes its probe directory, so anything like "autoaddd -v" only prints the version
 if (length(ARGV)) {
@@ -62,11 +62,14 @@ const UDP_MUTE_TICKS = 6;
 const UDP_WAIT_SEC = 180;
 const UDP_BAD_SEC = 24 * 3600;
 const UDP_IDLE_SEC = 7 * 24 * 3600;
-// an automatic TCP address no device has connected to for this long is removed; the daemon
-// must have watched for TCP_IDLE_WATCH_SEC first, the time it was stopped is not idle time
-const TCP_IDLE_SEC = 7 * 24 * 3600;
-const TCP_IDLE_WATCH_SEC = 24 * 3600;
-const TCP_IDLE_BATCH = 10;
+// an automatic entry is removed when no device has connected to the address or asked for a
+// name of the domain for this long; the daemon must have watched for IDLE_WATCH_SEC first,
+// the time it was stopped is not idle time
+const IDLE_SEC = 7 * 24 * 3600;
+const IDLE_WATCH_SEC = 24 * 3600;
+const IDLE_BATCH = 10;
+// without a single DNS answer for this long nobody is home or the daemon hears nothing
+const DNS_DEAF_SEC = 24 * 3600;
 // hosts of the CDN itself. A device asks for the site and gets such a name only as the
 // target of a CNAME, where a domain rule never matches: sing-box compares the name asked for
 const CDN_INFRA = [ "akamai.net", "akamaiedge.net", "edgekey.net", "edgesuite.net", "akadns.net",
@@ -108,6 +111,13 @@ let uflows = {};
 // conntrack table as read in the current tick
 let ct_text = null;
 let ct_read_done = false;
+// dom_seen: domain rules a name of which was asked for, until written to the database
+let dom_seen = {};
+let dns_heard = started;
+let dom_hold = 0;
+// own: addresses of the proxy servers podkop itself connects to
+let own = {};
+let own_next = 0;
 let dns_sub = null;
 let dns_ok = false;
 // sniff: raw socket that hears the DNS answers podkop gives dnsmasq
@@ -191,6 +201,36 @@ function site_name(n, asked) {
 function dom_of(ip) {
 	let n = names[ip];
 	return n ? site_name(n.n, n.q) : null;
+}
+
+// every rule that covers the name: the name itself and the domains above it
+function dom_asked(n) {
+	dns_heard = time();
+	n = lc(rtrim(n, "."));
+	while (true) {
+		if (db.domains[n])
+			dom_seen[n] = dns_heard;
+		let i = index(n, ".");
+		if (i < 0)
+			return;
+		n = substr(n, i + 1);
+	}
+}
+
+// d is validated by the caller
+function resolve(d) {
+	let res = [];
+	let p = fs.popen(`nslookup ${d} 127.0.0.1 2>/dev/null`, "r");
+	if (!p)
+		return res;
+	let out = p.read("all") ?? "";
+	p.close();
+	for (let line in split(out, "\n")) {
+		let m = match(line, /Address(?: [0-9]+)?: +([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
+		if (m && is_public(m[1]))
+			push(res, m[1]);
+	}
+	return res;
 }
 
 function total_added() {
@@ -458,18 +498,9 @@ function add_domain(d, meta) {
 	db.domains[d] = meta;
 	db.last = { id: d, ip: meta.ip, port: meta.port, name: d, how: meta.how, ts: meta.ts };
 	if (!meta.ip) {
-		let p = fs.popen(`nslookup ${d} 127.0.0.1 2>/dev/null`, "r");
-		if (p) {
-			let out = p.read("all") ?? "";
-			p.close();
-			for (let line in split(out, "\n")) {
-				let lm = match(line, /Address(?: [0-9]+)?: +([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
-				if (lm && parse_ip(lm[1]) && is_public(lm[1])) {
-					meta.ip = lm[1];
-					break;
-				}
-			}
-		}
+		let r = resolve(d);
+		if (length(r))
+			meta.ip = r[0];
 	}
 	let tip = meta.ip && !db.added[meta.ip];
 	if (tip)
@@ -559,6 +590,40 @@ function drop_cdn_domains() {
 			del_domain(d, "имя CDN, а не сайта: правило по нему не работает или захватывает чужие сайты");
 }
 
+// podkop reaches its proxy server directly. A closed port of that server (a panel behind
+// its firewall) looks blocked: silent directly, answering through the proxy, where the
+// server talks to itself. Routed that way, SSH to the server would need the very proxy
+// it is meant to repair
+function load_own() {
+	let now = time();
+	if (now < own_next)
+		return;
+	own_next = now + 600;
+	let path = uci.cursor().get("podkop", "settings", "config_path");
+	let j = null;
+	try { j = json(fs.readfile(type(path) == "string" && path ? path : "/etc/sing-box/config.json")); } catch (e) {}
+	if (type(j?.outbounds) != "array")
+		return;
+	let hosts = [];
+	for (let o in j.outbounds)
+		push(hosts, o?.server);
+	for (let ep in (type(j.endpoints) == "array" ? j.endpoints : []))
+		for (let p in (type(ep?.peers) == "array" ? ep.peers : []))
+			push(hosts, p?.address);
+	let res = {};
+	for (let h in hosts) {
+		if (parse_ip(h))
+			res[h] = true;
+		else if (clean_domain(h))
+			for (let ip in resolve(clean_domain(h)))
+				res[ip] = true;
+	}
+	own = res;
+	for (let ip in keys(own))
+		if (db.added[ip]?.how == "auto")
+			del_ip(ip, "это сервер прокси podkop: к нему соединение идёт напрямую");
+}
+
 function ct_read() {
 	if (!ct_read_done) {
 		ct_text = fs.readfile(CONNTRACK);
@@ -604,7 +669,7 @@ function prune_cands() {
 }
 
 function touch_cand(ip, port, proto, kind, weight) {
-	if (!is_public(ip) || db.added[ip] || db.ignore[ip])
+	if (!is_public(ip) || db.added[ip] || db.ignore[ip] || own[ip])
 		return;
 	let now = time();
 	let d = dom_of(ip);
@@ -906,28 +971,25 @@ function scan_udp() {
 		save_list(false);
 }
 
-// A blocked address is added for good, but sites move and CDN addresses rotate, so the
-// list only grows. Connections of the devices to an added address are seen in conntrack;
-// the probes of the router itself (its own address, ports 61000-61063) do not count
-function scan_tcp_use() {
-	let now = time(), watch = {}, n = 0;
+// A blocked entry is added for good, but sites move and CDN addresses rotate, so the list
+// only grows. Use of an address is seen in conntrack: connections of the devices to it,
+// not the probes of the router itself (its own address, ports 61000-61063). A domain is
+// routed to fake addresses, its use is the DNS questions for its names. Entries added by
+// hand are never removed here, the time of their use is only shown on the page
+function scan_use() {
+	let now = time(), watch = {}, n = 0, dirty = false;
 	for (let ip, e in db.added)
-		if (e.how == "auto" && e.proto == "tcp" && !e.trial) {
+		if (!e.trial && (e.how != "auto" || e.proto == "tcp")) {
 			watch[ip] = e;
 			n++;
 		}
-	if (!n)
-		return;
-	let s = ct_read();
-	if (s == null)
-		return;
-	let dirty = false;
-	for (let line in split(s, "\n")) {
-		if (index(line, " tcp ") < 0)
-			continue;
+	let s = n ? ct_read() : null;
+	for (let line in split(s ?? "", "\n")) {
 		let m = match(line, / src=([0-9.]+) dst=([0-9.]+) sport=([0-9]+) /);
 		let e = m ? watch[m[2]] : null;
 		if (!e || is_public(m[1]) || (+m[3] >= 61000 && +m[3] <= 61063))
+			continue;
+		if (e.how == "auto" && index(line, " tcp ") < 0)
 			continue;
 		// the time of the last use is written at most once a day to spare the flash
 		if (now - (e.use ?? 0) > 24 * 3600) {
@@ -935,17 +997,37 @@ function scan_tcp_use() {
 			dirty = true;
 		}
 	}
+	for (let d, t in dom_seen) {
+		let e = db.domains[d];
+		if (e && t - (e.use ?? 0) > 24 * 3600) {
+			e.use = t;
+			dirty = true;
+		}
+	}
+	dom_seen = {};
 	if (dirty)
 		save_db();
-	if (now - started < TCP_IDLE_WATCH_SEC)
+	if (now - dns_heard > DNS_DEAF_SEC)
+		dom_hold = now;
+	if (now - started < IDLE_WATCH_SEC)
 		return;
 	n = 0;
-	for (let ip, e in watch)
-		if (now - (e.use ?? e.ts ?? 0) > TCP_IDLE_SEC) {
-			del_ip(ip, "не использовался 7 дней");
-			if (++n >= TCP_IDLE_BATCH)
-				break;
-		}
+	if (s != null)
+		for (let ip, e in watch)
+			if (e.how == "auto" && now - (e.use ?? e.ts ?? 0) > IDLE_SEC) {
+				del_ip(ip, "не использовался 7 дней");
+				if (++n >= IDLE_BATCH)
+					return;
+			}
+	for (let d in keys(db.domains)) {
+		let e = db.domains[d];
+		let t = e.use ?? e.ts ?? 0;
+		if (e.how != "auto" || now - (t > dom_hold ? t : dom_hold) <= IDLE_SEC)
+			continue;
+		del_domain(d, "не запрашивался 7 дней");
+		if (++n >= IDLE_BATCH)
+			return;
+	}
 }
 
 // targets: { "ip:port": site name or null }. With a name the probe downloads from the site
@@ -1147,7 +1229,11 @@ function dns_subscribe() {
 	// dnsmasq publishes every answered A record on ubus; nothing is written to syslog
 	dns_sub ??= conn.subscriber(function(req) {
 		let d = req.data;
-		if (req.type != "dns_result" || d?.type != "A" || type(d.name) != "string" || !is_public(d.address))
+		if (req.type != "dns_result" || type(d?.name) != "string")
+			return;
+		// a domain that is already routed is answered with a fake address
+		dom_asked(d.name);
+		if (d.type != "A" || !is_public(d.address))
 			return;
 		if (!match(d.name, /^[0-9A-Za-z._-]{1,100}$/))
 			return;
@@ -1201,6 +1287,7 @@ function dns_answer(pkt) {
 	let q = dns_name(p, 12);
 	if (!q || !match(q[0], /^[0-9A-Za-z._-]{1,100}$/))
 		return;
+	dom_asked(q[0]);
 	let off = q[1];
 	if (off + 4 > n || ((ord(p, off) << 8) | ord(p, off + 1)) != 1)
 		return;
@@ -1320,10 +1407,11 @@ function tick() {
 	sniff_start();
 	prune_names();
 	expire_tips();
+	try { load_own(); } catch (e) { warn(`autoaddd: load_own: ${e}\n`); }
 	poll_sets();
 	try { scan_frozen(); } catch (e) { warn(`autoaddd: scan_frozen: ${e}\n`); }
 	try { scan_udp_stall(); udp_trials(); scan_udp(); } catch (e) { warn(`autoaddd: udp: ${e}\n`); }
-	try { scan_tcp_use(); } catch (e) { warn(`autoaddd: scan_tcp_use: ${e}\n`); }
+	try { scan_use(); } catch (e) { warn(`autoaddd: scan_use: ${e}\n`); }
 	if (!probing && !probe_cands())
 		recheck_added();
 	if (upd.state == "idle" && time() >= upd.next)
