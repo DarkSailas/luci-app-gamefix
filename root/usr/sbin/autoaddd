@@ -11,7 +11,7 @@ let uci = require("uci");
 let socket = null;
 try { socket = require("socket"); } catch (e) {}
 
-const VERSION = "3.0.7";
+const VERSION = "3.0.8";
 // the daemon takes no arguments. A copy started by hand next to the service flushes the same
 // nft sets and wipes its probe directory, so anything like "autoaddd -v" only prints the version
 if (length(ARGV)) {
@@ -62,6 +62,21 @@ const UDP_MUTE_TICKS = 6;
 const UDP_WAIT_SEC = 180;
 const UDP_BAD_SEC = 24 * 3600;
 const UDP_IDLE_SEC = 7 * 24 * 3600;
+// an automatic TCP address no device has connected to for this long is removed; the daemon
+// must have watched for TCP_IDLE_WATCH_SEC first, the time it was stopped is not idle time
+const TCP_IDLE_SEC = 7 * 24 * 3600;
+const TCP_IDLE_WATCH_SEC = 24 * 3600;
+const TCP_IDLE_BATCH = 10;
+// hosts of the CDN itself. A device asks for the site and gets such a name only as the
+// target of a CNAME, where a domain rule never matches: sing-box compares the name asked for
+const CDN_INFRA = [ "akamai.net", "akamaiedge.net", "edgekey.net", "edgesuite.net", "akadns.net",
+	"fastly.net", "fastlylb.net", "vercel-dns.com", "cloudflare.net", "trafficmanager.net", "t-msedge.net" ];
+// zones shared by the customers of a CDN or a hosting. The zone itself is never added, it
+// would route thousands of unrelated sites; a host in it only when a device asked for it by name
+const CDN_SHARED = [ "cloudfront.net", "b-cdn.net", "azureedge.net", "azurefd.net", "amazonaws.com",
+	"akamaihd.net", "akamaized.net", "cdn77.org", "kxcdn.com", "gcdn.co", "core.windows.net",
+	"googleusercontent.com", "github.io", "pages.dev", "workers.dev", "vercel.app", "netlify.app",
+	"web.app", "herokuapp.com" ];
 const MAX_PCS = 32;
 const LEASES = "/tmp/dhcp.leases";
 // addresses on trial, kept off the flash; read at start to take them back from podkop
@@ -157,8 +172,25 @@ function clean_domain(n) {
 	return match(n, /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,23}$/) ? n : null;
 }
 
+function under(n, zones) {
+	for (let z in zones)
+		if (n == z || substr(n, -length(z) - 1) == "." + z)
+			return z;
+	return null;
+}
+
+// name a domain rule can be made of; asked: a device asked for exactly this name
+function site_name(n, asked) {
+	let d = clean_domain(n);
+	if (!d || under(d, CDN_INFRA))
+		return null;
+	let z = under(d, CDN_SHARED);
+	return z && (d == z || !asked) ? null : d;
+}
+
 function dom_of(ip) {
-	return clean_domain(names[ip]?.n);
+	let n = names[ip];
+	return n ? site_name(n.n, n.q) : null;
 }
 
 function total_added() {
@@ -520,6 +552,13 @@ function drop_udp_domains() {
 			del_domain(d, "серверы UDP теперь добавляются по адресу и проверяются пробой");
 }
 
+// rules made by earlier versions out of CDN names: they match nothing or far too much
+function drop_cdn_domains() {
+	for (let d in keys(db.domains))
+		if (db.domains[d].how == "auto" && !site_name(d, true))
+			del_domain(d, "имя CDN, а не сайта: правило по нему не работает или захватывает чужие сайты");
+}
+
 function ct_read() {
 	if (!ct_read_done) {
 		ct_text = fs.readfile(CONNTRACK);
@@ -867,6 +906,48 @@ function scan_udp() {
 		save_list(false);
 }
 
+// A blocked address is added for good, but sites move and CDN addresses rotate, so the
+// list only grows. Connections of the devices to an added address are seen in conntrack;
+// the probes of the router itself (its own address, ports 61000-61063) do not count
+function scan_tcp_use() {
+	let now = time(), watch = {}, n = 0;
+	for (let ip, e in db.added)
+		if (e.how == "auto" && e.proto == "tcp" && !e.trial) {
+			watch[ip] = e;
+			n++;
+		}
+	if (!n)
+		return;
+	let s = ct_read();
+	if (s == null)
+		return;
+	let dirty = false;
+	for (let line in split(s, "\n")) {
+		if (index(line, " tcp ") < 0)
+			continue;
+		let m = match(line, / src=([0-9.]+) dst=([0-9.]+) sport=([0-9]+) /);
+		let e = m ? watch[m[2]] : null;
+		if (!e || is_public(m[1]) || (+m[3] >= 61000 && +m[3] <= 61063))
+			continue;
+		// the time of the last use is written at most once a day to spare the flash
+		if (now - (e.use ?? 0) > 24 * 3600) {
+			e.use = now;
+			dirty = true;
+		}
+	}
+	if (dirty)
+		save_db();
+	if (now - started < TCP_IDLE_WATCH_SEC)
+		return;
+	n = 0;
+	for (let ip, e in watch)
+		if (now - (e.use ?? e.ts ?? 0) > TCP_IDLE_SEC) {
+			del_ip(ip, "не использовался 7 дней");
+			if (++n >= TCP_IDLE_BATCH)
+				break;
+		}
+}
+
 // targets: { "ip:port": site name or null }. With a name the probe downloads from the site
 // (SNI and Host are set), without it only the TLS handshake by bare address is checked
 function run_probe(targets, cb) {
@@ -1010,7 +1091,7 @@ function recheck_added() {
 	for (let d, e in db.domains)
 		take(true, d, e, e.ip, d);
 	for (let ip, e in db.added)
-		take(false, ip, e, ip, clean_domain(index(e.name ?? "ptr:", "ptr:") == 0 ? null : e.name));
+		take(false, ip, e, ip, site_name(index(e.name ?? "ptr:", "ptr:") == 0 ? null : e.name, true));
 	if (!length(items))
 		return;
 	run_probe(t, function(res) {
@@ -1242,6 +1323,7 @@ function tick() {
 	poll_sets();
 	try { scan_frozen(); } catch (e) { warn(`autoaddd: scan_frozen: ${e}\n`); }
 	try { scan_udp_stall(); udp_trials(); scan_udp(); } catch (e) { warn(`autoaddd: udp: ${e}\n`); }
+	try { scan_tcp_use(); } catch (e) { warn(`autoaddd: scan_tcp_use: ${e}\n`); }
 	if (!probing && !probe_cands())
 		recheck_added();
 	if (upd.state == "idle" && time() >= upd.next)
@@ -1596,6 +1678,7 @@ nft_setup();
 drop_stale_trials();
 sync_all();
 drop_udp_domains();
+drop_cdn_domains();
 log(`запущен, версия ${VERSION}, наблюдаю за: ${join(", ", cfg.pcs)}`);
 uci.cursor().foreach("firewall", "defaults", function(s) {
 	// an offloaded flow bypasses the forward hook and may stop updating its conntrack counters

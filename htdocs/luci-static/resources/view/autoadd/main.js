@@ -18,7 +18,7 @@ var callUpdate = rpc.declare({ object: 'autoadd', method: 'update', expect: { ''
 var callSetAutoupdate = rpc.declare({ object: 'autoadd', method: 'set_autoupdate', params: [ 'auto' ], expect: { '': {} } });
 
 // must match VERSION in /usr/sbin/autoaddd: a mismatch means the browser runs a cached copy of this file
-var VIEW_VERSION = '3.0.7';
+var VIEW_VERSION = '3.0.8';
 var RELOAD_KEY = 'autoadd.reload';
 
 // short label and colour of a candidate status; the full text goes below it
@@ -662,7 +662,7 @@ return view.extend({
 			self.section('added', 'Через прокси', [
 				E('div', { 'class': 'aa-bar' }, [
 					E('span', { 'class': 'aa-hint', 'style': 'flex:1 1 20em' },
-						'Домены и адреса, которые направляются через podkop. Все записи (включая добавленные вручную) перепроверяются каждые 6 часов и удаляются, если снова доступны напрямую. Серверы UDP (игры/голос) добавляются на пробу: без ответа удаляются через 3 минуты, а неиспользуемые — через 7 дней.'),
+						'Домены и адреса, которые направляются через podkop. Все записи (включая добавленные вручную) перепроверяются каждые 6 часов и удаляются, если снова доступны напрямую. Серверы UDP (игры/голос) добавляются на пробу: без ответа удаляются через 3 минуты. Адрес, добавленный службой, удаляется, если к нему 7 дней никто не обращался.'),
 					addedMore ? btn(self.showAllAdded ? 'Только последние' : 'Показать все', 'cbi-button-neutral', function() {
 						self.showAllAdded = !self.showAllAdded;
 						return self.refresh();
