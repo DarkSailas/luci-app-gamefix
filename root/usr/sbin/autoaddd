@@ -11,7 +11,7 @@ let uci = require("uci");
 let socket = null;
 try { socket = require("socket"); } catch (e) {}
 
-const VERSION = "3.0.9";
+const VERSION = "3.0.10";
 // the daemon takes no arguments. A copy started by hand next to the service flushes the same
 // nft sets and wipes its probe directory, so anything like "autoaddd -v" only prints the version
 if (length(ARGV)) {
@@ -975,7 +975,7 @@ function scan_udp() {
 // only grows. Use of an address is seen in conntrack: connections of the devices to it,
 // not the probes of the router itself (its own address, ports 61000-61063). A domain is
 // routed to fake addresses, its use is the DNS questions for its names. Entries added by
-// hand are never removed here, the time of their use is only shown on the page
+// hand go by the same rule
 function scan_use() {
 	let now = time(), watch = {}, n = 0, dirty = false;
 	for (let ip, e in db.added)
@@ -1005,6 +1005,18 @@ function scan_use() {
 		}
 	}
 	dom_seen = {};
+	// use of the domains and of the entries added by hand was not watched by the versions
+	// before 3.0.9: their idle time starts now, not on the day they were added
+	for (let ip, e in watch)
+		if (e.how != "auto" && e.use == null) {
+			e.use = now;
+			dirty = true;
+		}
+	for (let d, e in db.domains)
+		if (e.use == null) {
+			e.use = now;
+			dirty = true;
+		}
 	if (dirty)
 		save_db();
 	if (now - dns_heard > DNS_DEAF_SEC)
@@ -1014,7 +1026,7 @@ function scan_use() {
 	n = 0;
 	if (s != null)
 		for (let ip, e in watch)
-			if (e.how == "auto" && now - (e.use ?? e.ts ?? 0) > IDLE_SEC) {
+			if (now - (e.use ?? e.ts ?? 0) > IDLE_SEC) {
 				del_ip(ip, "не использовался 7 дней");
 				if (++n >= IDLE_BATCH)
 					return;
@@ -1022,7 +1034,7 @@ function scan_use() {
 	for (let d in keys(db.domains)) {
 		let e = db.domains[d];
 		let t = e.use ?? e.ts ?? 0;
-		if (e.how != "auto" || now - (t > dom_hold ? t : dom_hold) <= IDLE_SEC)
+		if (now - (t > dom_hold ? t : dom_hold) <= IDLE_SEC)
 			continue;
 		del_domain(d, "не запрашивался 7 дней");
 		if (++n >= IDLE_BATCH)
